@@ -7,6 +7,8 @@
 #include "esp_adc/adc_oneshot.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "esp_timer.h"
+
 #define SERVOPIN 15
 #define S_LOCKED (3277 * (1.5))
 #define S_UNLOCKED (3277 * (.6))
@@ -15,14 +17,20 @@
 #define ADCPIN1 ADC_CHANNEL_5 //GPIO 33
 #define ADCPIN2 ADC_CHANNEL_4 //GPIO 32
 #define ADCPIN3 ADC_CHANNEL_7 //GPIO 35
-#define LED1 14
+#define LED1 14 //target LED -> if i add a 4th LED this is the sync reference
 #define LED2 2
 #define LED3 4
 #define BUTTON1 5 //needs to be interrupt //scrambles or solves step 1 
 #define GPIO_INPUT_PIN_SEL (1ULL << BUTTON1)
 #define low 0
 #define high 4095
-static int leds[3] = {LED1, LED2, LED3};
+#define slow_blink 1000 //1000ms per toggle
+#define fast_blink 50
+
+
+static int leds[3] = {LED3, LED2, LED1};
+
+
 
 
 
@@ -162,13 +170,14 @@ void periphinit (void) {
 
     for (int i = 0; i < 3; i++) {
         rom_gpio_pad_select_gpio(leds[i]); 
-        gpio_set_direction(outputs[i], GPIO_MODE_OUTPUT);
-        gpio_set_level(outputs[i], 0);
+        gpio_set_direction(leds[i], GPIO_MODE_OUTPUT);
+        gpio_set_level(leds[i], 0);
     }
    
     //using ADC1 Channels 
     adc_oneshot_unit_init_cfg_t pot_handle = {.unit_id = ADC_UNIT_1}; 
     adc_oneshot_new_unit(&pot_handle, &puzzletask1);
+    
     //Channel Set Up 
     adc_oneshot_chan_cfg_t pot_channel = {.bitwidth = ADC_BITWIDTH_12, .atten = ADC_ATTEN_DB_12};
     adc_oneshot_config_channel(puzzletask1, ADCPIN1, &pot_channel);
@@ -188,24 +197,51 @@ void periphinit (void) {
     ledc_channel_config(&servo_conf);
 }
 
+//should take a semaphore, that step 2 of the puzzle wants, but wont be released until the lights are synced
 
-//set up the solving blinkrate -> we need one main one to be offsetted by values to guarantee solvability
-void scrambleLEDs (int value) {
-int value1 = 1500 + esp_random() % 2001; //generates random number between 1500 - 3500 
-return value1; 
+void P_STEP1 (void *pvParameters) {
+int cap_pot1, cap_pot2, cap_pot3;
+int *pots[3] = {&cap_pot1, &cap_pot2, &cap_pot3};
+//int base[3], period[3], state[3];
+unsigned long last_ms[3] = {0,0,0};
+bool LEDon[3] = {false,false,false};
+while(1) {
+
+adc_oneshot_read(puzzletask1, ADCPIN1, &cap_pot1);
+adc_oneshot_read(puzzletask1, ADCPIN2, &cap_pot2);
+adc_oneshot_read(puzzletask1, ADCPIN3, &cap_pot3); 
+// normalize = adc/ADC_MAX, span = slow_blink - fast_blink, 
+
+int64_t current_time = esp_timer_get_time() / 1000; //64 digit current time in microseconds / 1000 = current time in ms
+for (int i = 0; i<3; i++) {
+uint32_t interval = slow_blink - ((uint64_t)*pots[i]) * (slow_blink - fast_blink)/high; 
+    
+if (current_time - last_ms[i] >= interval) {
+    last_ms[i] = current_time;
+    LEDon[i] = !LEDon[i]; //toggle bool for LED 
+    gpio_set_level(leds[i], LEDon[i]);
 
 }
+}
+vTaskDelay(1);
+
+}
+}
+
 
 void app_main (void) 
 {
 periphinit();
+xTaskCreate(&P_STEP1, "Puzzle Step 1", 4096, NULL, 5, NULL);
+
+
+
 
 /**TEST ADC
 int cap_pot1, cap_pot2, cap_pot3;
 while (1) {
 adc_oneshot_read(puzzletask1, ADCPIN1, &cap_pot1);
-adc_oneshot_read(puzzletask1, ADCPIN2, &cap_pot2);
-adc_oneshot_read(puzzletask1, ADCPIN3, &cap_pot3);
+
 printf("%d\n", cap_pot1);
 printf("%d\n", cap_pot2);
 printf("%d\n", cap_pot3);
