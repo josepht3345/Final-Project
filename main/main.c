@@ -27,11 +27,13 @@
 #define ADC_MAX 4095
 #define slow_blink 1000 //1000ms per toggle
 #define fast_blink 50
-#define threshold 30
-#define release_threshold 40
+#define threshold 40
+#define release_threshold 50
 //LEDS BLINK FROM 50ms to 1000ms
+static volatile TickType_t lastTime1 = 0;  //debounce protection
 static int all_leds[] = {LED1,LED2,LED3,TEMPOLED};
-
+//global flags
+bool sync = false; //is task 1 synchronized? 
 
 //const static char http_html_hdr[] = "HTTP/1.1 200 OK\r\nContent-type: text/html\r\n\r\n";
 //const static char http_html_txt[] = "HTTP/1.1 200 OK\r\nContent-type: text/plain\r\n\r\n";
@@ -153,18 +155,40 @@ http.send();
 </html>
 )=====";
 **/
-
+SemaphoreHandle_t Step1Sem;
+SemaphoreHandle_t Step2Sem;
 adc_oneshot_unit_handle_t puzzletask1;
 
+static void IRAM_ATTR B_Handler (void* arg) {
+    uint32_t gpio_num = (uint32_t) arg;
+    TickType_t TimeNOW = xTaskGetTickCountFromISR();
+    if (gpio_num == BUTTON1) {
+        if ((TimeNOW - lastTime1) >= pdMS_TO_TICKS(200)) {
+            lastTime1 = TimeNOW;
+            BaseType_t woken = pdFALSE; 
+            xSemaphoreGiveFromISR(Step1Sem, &woken); //second arg is = pdTRUE when successfully taken  
+    }
+    }
+}
+
+void int_setup() {
+    gpio_config_t io_conf;
+    io_conf.intr_type = GPIO_INTR_NEGEDGE;
+    io_conf.mode = GPIO_MODE_INPUT;
+    io_conf.pin_bit_mask = GPIO_INPUT_PIN_SEL;
+    io_conf.pull_down_en = GPIO_PULLDOWN_DISABLE;
+    io_conf.pull_up_en = GPIO_INPUT_PIN_SEL;
+    gpio_config(&io_conf);
+    gpio_install_isr_service(0);
+    gpio_isr_handler_add(BUTTON1, B_Handler, (void*) BUTTON1);
+}
 
 void periphinit (void) {
-    //Input Set Up 
+ /* //Input Set Up 
     rom_gpio_pad_select_gpio(BUTTON1);
     gpio_set_direction(BUTTON1, GPIO_MODE_INPUT);
     gpio_pullup_en(BUTTON1); 
-    
-    
-    
+ */   
     //LED Set Up
 
     for (int i = 0; i < (sizeof(all_leds)/sizeof(all_leds[0])); i++) {
@@ -197,87 +221,114 @@ void periphinit (void) {
 }
 
 int scramble_tempo (void) { //generates an interval between 50ms 150ms and 950ms 
-int scramble_value = 150 + esp_random() % 751;
-return scramble_value; 
+    int scramble_value = 150 + esp_random() % 751;
+    return scramble_value; 
 } 
 //should take a semaphore, that step 2 of the puzzle wants, but wont be released until the lights are synced
 
 void P_STEP1 (void *pvParameters) {
-int leds[3] = {LED3, LED2, LED1};
-int cap_pot1, cap_pot2, cap_pot3;
-int *pots[3] = {&cap_pot1, &cap_pot2, &cap_pot3};
-//int base[3], period[3], state[3];
-int64_t last_ms[3];
-bool LEDon[3] = {false,false,false};
-int32_t interval[3]; 
-bool locked[3] = {false, false, false}; //this checks if all three LEDs are synced up 
-//tempo 
-int target = scramble_tempo();
-int64_t temp_last_ms;
-bool tempon = false;
-//start times for each LED
-int64_t start_time = esp_timer_get_time() / 1000;
-for (int i = 0; i<3; i++) {
- last_ms[i] = start_time; 
-}
- temp_last_ms = start_time;
+    int leds[3] = {LED3, LED2, LED1};
+    int cap_pot1, cap_pot2, cap_pot3;
+    int *pots[3] = {&cap_pot1, &cap_pot2, &cap_pot3};
 
-while(1) {
-
-adc_oneshot_read(puzzletask1, ADCPIN1, &cap_pot1);
-adc_oneshot_read(puzzletask1, ADCPIN2, &cap_pot2);
-adc_oneshot_read(puzzletask1, ADCPIN3, &cap_pot3); 
-// normalize = adc/ADC_MAX, span = slow_blink - fast_blink
-int64_t current_time = esp_timer_get_time() / 1000; //64 digit current time in microseconds / 1000 = current time in ms
-
-//generate intervals 
-for (int i = 0; i<(sizeof(leds)/sizeof(leds[0])); i++) {
-interval[i] = slow_blink - ((int64_t)*pots[i]) * (slow_blink - fast_blink)/ADC_MAX; 
-//if within threshold - mirror tempo 
-
-}
-
-//need to check if intervals are within the threshhold since we measure 50 - 1000ms using 20ms threshhold
-for (int i = 0 ; i<(sizeof(leds)/sizeof(leds[0])); i++) {
-if (locked[i] != true && (abs(interval[i] - target) < threshold)) {
-    locked[i] = true;
-}
-}
-
-//tempo interval and blink
-if (current_time - temp_last_ms >= target) {
-    temp_last_ms += target;
-    tempon = !tempon;
-    gpio_set_level(TEMPOLED, tempon);
-}
-
-if (current_time - temp_last_ms >= 200) {
-    printf("%d, %d, %d\n", locked[0], locked[1], locked[2]);
-}
-
-//toggle led blink
-for (int j = 0; j < (sizeof(leds)/sizeof(leds[0])); j++) {
-
-if (locked[j]) {
-    if ((abs(interval[j] - target) > release_threshold )) {
-    locked[j] = false;
+    int64_t last_ms[3];
+    bool LEDon[3] = {false,false,false};
+    int32_t interval[3]; 
+    bool locked[3] = {false, false, false}; //this checks if all three LEDs are synced up 
+    //tempo 
+    int target = scramble_tempo();
+    int64_t temp_last_ms;
+    bool tempon = false;
+    //start times for each LED
+    int64_t start_time = esp_timer_get_time() / 1000;
+    for (int i = 0; i<3; i++) {
+    last_ms[i] = start_time; 
     }
-    else {
-    last_ms[j] = temp_last_ms; 
-    LEDon[j] = tempon;
-    gpio_set_level(leds[j], tempon);
+    temp_last_ms = start_time;
+
+    while(1) {
+
+    adc_oneshot_read(puzzletask1, ADCPIN1, &cap_pot1);
+    adc_oneshot_read(puzzletask1, ADCPIN2, &cap_pot2);
+    adc_oneshot_read(puzzletask1, ADCPIN3, &cap_pot3); 
+    // normalize = adc/ADC_MAX, span = slow_blink - fast_blink
+    int64_t current_time = esp_timer_get_time() / 1000; //64 digit current time in microseconds / 1000 = current time in ms
+
+    //generate intervals 
+    for (int i = 0; i<(sizeof(leds)/sizeof(leds[0])); i++) {
+    interval[i] = slow_blink - ((int64_t)*pots[i]) * (slow_blink - fast_blink)/ADC_MAX; 
+    //if within threshold - mirror tempo 
+
     }
+
+    //need to check if intervals are within the threshhold since we measure 50 - 1000ms using 20ms threshhold
+    for (int i = 0 ; i<(sizeof(leds)/sizeof(leds[0])); i++) {
+    if (locked[i] != true && (abs(interval[i] - target) < threshold)) {
+        locked[i] = true;
+    }
+    }
+
+    //tempo interval and blink
+    if (current_time - temp_last_ms >= target) {
+        temp_last_ms += target;
+        tempon = !tempon;
+        gpio_set_level(TEMPOLED, tempon);
+    }
+
+    if (current_time - temp_last_ms >= 200) {
+        printf("%d, %d, %d\n", locked[0], locked[1], locked[2]);
+    }
+
+    //toggle led blink
+    for (int j = 0; j < (sizeof(leds)/sizeof(leds[0])); j++) {
+    //if within threshold -> lock on to the tempo
+    if (locked[j]) {
+        //assigns blink rate to tempo blink rate
+        if ((abs(interval[j] - target) > release_threshold )) {
+        locked[j] = false;
+        }
+        else { 
+        last_ms[j] = temp_last_ms; 
+        LEDon[j] = tempon;
+        gpio_set_level(leds[j], tempon);
+        }
+    }
+    //if unlocked -> use pot blink rate 
+    else if ((current_time - last_ms[j] >= interval[j])) {
+        last_ms[j] += interval[j];
+        LEDon[j] = !LEDon[j]; //toggle bool for LED 
+        gpio_set_level(leds[j], LEDon[j]);
+    }
+
+    }
+
+
+    if(xSemaphoreTake(Step1Sem, 0) == pdTRUE) {
+        if ((locked[0] == true && locked[1] == true && locked[2] == true))  {
+            sync = true;
+            }
+
+        else {
+            sync = false; 
+             }
+
+        }
+    if (sync) {
+        xSemaphoreGive(Step2Sem);
+        vTaskDelete(NULL);
+    }   
+    vTaskDelay(1);
+    }
+    
 }
 
-else if ((current_time - last_ms[j] >= interval[j])) {
-    last_ms[j] += interval[j];
-    LEDon[j] = !LEDon[j]; //toggle bool for LED 
-    gpio_set_level(leds[j], LEDon[j]);
-}
-
-}
-vTaskDelay(1);
-}
+void P_STEP2 (void *pvParameters) {
+if (xSemaphoreTake(Step2Sem,portMAX_DELAY) == pdTRUE) {
+    for(int i = 0; i < (sizeof(all_leds)/ sizeof(all_leds[0])); i++) {
+        gpio_set_level(all_leds[i], 0);
+    }
+    vTaskDelete(NULL);
+}   
 }
 
 
@@ -286,9 +337,13 @@ vTaskDelay(1);
 void app_main (void) 
 {
 
-periphinit();
-xTaskCreate(&P_STEP1, "Puzzle Step 1", 4096, NULL, 5, NULL);
 
+Step1Sem = xSemaphoreCreateBinary();
+Step2Sem = xSemaphoreCreateBinary();
+xTaskCreate(&P_STEP1, "Puzzle Step 1", 4096, NULL, 5, NULL);
+xTaskCreate(&P_STEP2, "Puzzle Step 2", 4096, NULL, 5, NULL);
+periphinit();
+int_setup();
 
 
 
